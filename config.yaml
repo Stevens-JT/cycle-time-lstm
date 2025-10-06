@@ -1,0 +1,25 @@
+# Project configuration for Cycle Time Prediction (PySpark ETL + ML)
+time_series_columns:
+  - ts_1
+  - ts_2
+  - ts_3
+  - ts_4
+  - ts_5
+  - ts_6
+  - ts_7
+  - ts_8
+  - ts_9
+  - ts_10
+  - ts_11
+  - ts_12
+id_column: serial_id
+cycle_number_column: cycle_number
+timestamp_column: cycle_timestamp
+good_bad_label_column: good_label
+csv_path: data/cycles.csv
+raw_parquet_path: outputs/raw_spark.parquet
+features_parquet_path: outputs/features_spark.parquet
+split:
+  train: 0.7
+  val: 0.15
+  test: 0.15
