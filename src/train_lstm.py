@@ -1,165 +1,378 @@
-import pandas as pd, numpy as np, torch, torch.nn as nn
-from sklearn.preprocessing import StandardScaler
-import joblib
+#!/usr/bin/env python3
+import argparse
+import datetime as dt
+import math
+import os
 from pathlib import Path
-import math, time
 
-PARQUET = "outputs/features_spark.parquet"
-TARGET = "CycleTime_sec"
-ID = "serial_id"
-ORDER = "cycle_number"
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
-WINDOW = 10
-EPOCHS = 100
-PATIENCE = 10          # early stopping patience (epochs)
-BATCH = 64
-LR = 1e-3
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# -----------------------------
+# Utilities
+# -----------------------------
 
-class LSTMReg(nn.Module):
-    def __init__(self, in_dim, hidden=128):
+def set_seed(seed: int = 42):
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+class SeqDataset(Dataset):
+    def __init__(self, X3, y_sec, y_long):
+        self.X3 = X3.astype(np.float32)
+        self.y_sec = y_sec.astype(np.float32)  # raw seconds (or log)
+        self.y_long = y_long.astype(np.float32)  # 0/1
+    def __len__(self):
+        return self.X3.shape[0]
+    def __getitem__(self, idx):
+        return (
+            torch.from_numpy(self.X3[idx]),
+            torch.from_numpy(self.y_sec[idx:idx+1]),
+            torch.from_numpy(self.y_long[idx:idx+1]),
+        )
+
+class LSTMTwoHead(nn.Module):
+    def __init__(self, n_feat, hidden=64, num_layers=1, dropout=0.1):
         super().__init__()
-        self.lstm = nn.LSTM(in_dim, hidden, num_layers=1, batch_first=True)
-        self.head = nn.Sequential(nn.Linear(hidden, 64), nn.ReLU(), nn.Linear(64, 1))
+        self.lstm = nn.LSTM(input_size=n_feat, hidden_size=hidden, num_layers=num_layers, batch_first=True, dropout=0.0 if num_layers==1 else dropout)
+        self.head_reg = nn.Sequential(
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, 1),
+        )
+        self.head_cls = nn.Sequential(
+            nn.Linear(hidden, hidden//2),
+            nn.ReLU(),
+            nn.Linear(hidden//2, 1),
+        )
     def forward(self, x):
+        # x: [B, T, F]
         out, _ = self.lstm(x)
-        return self.head(out[:, -1, :])
+        h = out[:, -1, :]  # last timestep
+        logit_long = self.head_cls(h)
+        pred_sec   = self.head_reg(h)
+        return logit_long, pred_sec
 
-def make_windows(df, feat_cols, window=10):
-    Xw, yw = [], []
-    for _, g in df.groupby(ID):
-        arr = g[feat_cols].values
-        y = g[TARGET].values
-        if len(arr) <= window:
-            continue
-        for i in range(window, len(arr)):
-            Xw.append(arr[i-window:i])
-            yw.append(y[i])
-    return np.asarray(Xw, dtype=np.float32), np.asarray(yw, dtype=np.float32).reshape(-1,1)
+def huber_loss(pred, target, beta=1.0, reduction="none"):
+    # pred, target: [B, 1]
+    err = pred - target
+    abs_err = torch.abs(err)
+    quad = torch.minimum(abs_err, torch.tensor(beta, device=pred.device))
+    lin  = abs_err - quad
+    loss = 0.5 * quad**2 / beta + lin
+    if reduction == "mean":
+        return loss.mean()
+    elif reduction == "sum":
+        return loss.sum()
+    return loss
 
-def rmse(a, b):
-    return float(np.sqrt(np.mean((a-b)**2)))
+def bce_with_logits_focal(logits, targets, gamma=0.0, pos_weight=None):
+    # logits/targets: [B,1]
+    # standard BCE with logits
+    bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none", pos_weight=pos_weight)
+    if gamma <= 0.0:
+        return bce.mean()
+    p = torch.sigmoid(logits)
+    pt = targets * p + (1 - targets) * (1 - p)
+    fl = (1 - pt) ** gamma * bce
+    return fl.mean()
+
+def build_sequences(df, seq_len, feature_cols):
+    # df is already split-filtered, sorted by C
+    X, y = [], []
+    for i in range(len(df) - seq_len + 1):
+        window = df.iloc[i:i+seq_len]
+        target_row = df.iloc[i+seq_len-1]
+        X.append(window[feature_cols].values)
+        y.append(target_row["CycleTime_sec"])
+    X = np.array(X, dtype=np.float32)  # [N, T, F]
+    y = np.array(y, dtype=np.float32)  # [N]
+    return X, y
+
+def standardize(train_arr, *others):
+    mean = train_arr.mean(axis=(0,1), keepdims=True)
+    std  = train_arr.std(axis=(0,1), keepdims=True) + 1e-8
+    out = [(train_arr - mean) / std]
+    for arr in others:
+        out.append((arr - mean) / std)
+    return out
 
 def main():
-    df = pd.read_parquet(PARQUET).dropna(subset=[TARGET])
-    # Drop unused columns
-    drop = [c for c in df.columns if c.lower() in ["cycle_timestamp", "good_label"]]
-    for c in drop:
-        if c in df.columns: df = df.drop(columns=[c])
-    # Sort for deterministic windowing
-    if ORDER in df.columns:
-        df = df.sort_values([ID, ORDER])
+    p = argparse.ArgumentParser()
+    p.add_argument("--seq_len", type=int, default=5)
+    p.add_argument("--epochs", type=int, default=50)
+    p.add_argument("--patience", type=int, default=8)
+    p.add_argument("--hidden", type=int, default=64)
+    p.add_argument("--num_layers", type=int, default=1)
+    p.add_argument("--dropout", type=float, default=0.0)
+    p.add_argument("--loss", type=str, default="huber", choices=["huber","l1","l2"])
+    p.add_argument("--huber_beta", type=float, default=1.0)
+    p.add_argument("--log_target", action="store_true")
+    p.add_argument("--long_thresh", type=float, default=90.0)
+    p.add_argument("--alpha_cls", type=float, default=0.05, help="final weight for classifier after warm-up")
+    p.add_argument("--alpha_reg", type=float, default=1.0)
+    p.add_argument("--reg_w_long", type=float, default=3.0)
+    p.add_argument("--reg_w_short", type=float, default=0.2)
+    # New: warm-up & sampler
+    p.add_argument("--warmup_epochs", type=int, default=5, help="epochs to ramp classifier from 0 -> alpha_cls")
+    p.add_argument("--use_weighted_sampler", action="store_true")
+    p.add_argument("--oversample_long", type=float, default=20.0, help="weight multiplier for long samples in sampler")
+    p.add_argument("--focal_gamma", type=float, default=0.0, help=">0 to enable focal weighting for cls head")
+    p.add_argument("--seed", type=int, default=42)
+    args = p.parse_args()
+
+    set_seed(args.seed)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    features_path = "outputs/features_spark.parquet"
+    df = pd.read_parquet(features_path)
+    print("Columns:", df.columns.tolist())
+    print("Rows total:", len(df))
+
+    # Make sure required columns exist
+    req = {"A","B","C","split","CycleTime_sec"}
+    assert req.issubset(df.columns), f"Missing required columns: {req - set(df.columns)}"
+
+    df["C"] = pd.to_datetime(df["C"])
+    df = df.sort_values(["C","A","B"]).reset_index(drop=True)
+
+    print("Has 'split' + target:", {("split" in df.columns) and ("CycleTime_sec" in df.columns)})
+    print(df["split"].value_counts())
+
+    # Keep only rows with target present
+    df = df.dropna(subset=["CycleTime_sec"])
+
+    # Identify feature columns (exclude id/time/split/target)
+    exclude = {"A","B","C","D","split","next_ts","CycleTime_sec"}
+    feature_cols = [c for c in df.columns if c not in exclude and np.issubdtype(df[c].dtype, np.number)]
+    n_feat = len(feature_cols)
+    print(f"# Feature columns: {n_feat}")
+
+    # Build sequences per split
+    seq_len = args.seq_len
+    train_df = df[df["split"]=="train"].copy().sort_values("C")
+    val_df   = df[df["split"]=="val"].copy().sort_values("C")
+    test_df  = df[df["split"]=="test"].copy().sort_values("C")
+
+    Xtr, ytr = build_sequences(train_df, seq_len, feature_cols)
+    Xva, yva = build_sequences(val_df,   seq_len, feature_cols)
+    Xte, yte = build_sequences(test_df,  seq_len, feature_cols)
+
+    # Save raw y (seconds) for export metrics
+    ytr_raw = ytr.copy()
+    yva_raw = yva.copy()
+    yte_raw = yte.copy()
+
+    # Long/short labels (based on raw seconds)
+    thr = args.long_thresh
+    ytr_long = (ytr_raw >= thr).astype(np.float32)
+    yva_long = (yva_raw >= thr).astype(np.float32)
+    yte_long = (yte_raw >= thr).astype(np.float32)
+    print(f"Train long-rate (>={thr}s): {ytr_long.mean():.4f}")
+
+    # Standardize inputs based on TRAIN only
+    Xtr_s, Xva_s, Xte_s = standardize(Xtr, Xva, Xte)
+
+    # Optionally transform targets (log1p)
+    if args.log_target:
+        ytr_t = np.log1p(ytr_raw)
+        yva_t = np.log1p(yva_raw)
+        yte_t = np.log1p(yte_raw)
+        def inv(x): return np.expm1(x)
     else:
-        df = df.sort_values([ID])
+        ytr_t, yva_t, yte_t = ytr_raw, yva_raw, yte_raw
+        def inv(x): return x
 
-    # Split by time-based labels produced by Spark ETL
-    if "split" in df.columns:
-        tr = df[df["split"] == "train"].copy()
-        va = df[df["split"] == "val"].copy()
-        te = df[df["split"] == "test"].copy()
+    # Torch datasets
+    tr_ds = SeqDataset(Xtr_s, ytr_t, ytr_long)
+    va_ds = SeqDataset(Xva_s, yva_t, yva_long)
+    te_ds = SeqDataset(Xte_s, yte_t, yte_long)
+
+    # Weighted sampler to oversample LONG examples
+    if args.use_weighted_sampler and (ytr_long.sum() > 0):
+        w = np.where(ytr_long > 0.5, args.oversample_long, 1.0).astype(np.float32)
+        sampler = WeightedRandomSampler(weights=torch.from_numpy(w), num_samples=len(w), replacement=True)
+        train_loader = DataLoader(tr_ds, batch_size=64, sampler=sampler, drop_last=False)
+        print(f"Using WeightedRandomSampler (oversample_long={args.oversample_long})")
     else:
-        # Fallback to simple 80/20 split on index (rare)
-        n = len(df); ntr = int(n*0.8)
-        tr, va, te = df.iloc[:ntr], df.iloc[ntr:], df.iloc[ntr:]
+        train_loader = DataLoader(tr_ds, batch_size=64, shuffle=True, drop_last=False)
+    val_loader = DataLoader(va_ds, batch_size=256, shuffle=False, drop_last=False)
+    test_loader= DataLoader(te_ds, batch_size=256, shuffle=False, drop_last=False)
 
-    # Feature columns (numeric only, excluding id/order/target/split)
-    exclude = {TARGET, ID, ORDER, "split"}
-    feat_cols = [c for c in df.columns if c not in exclude and np.issubdtype(df[c].dtype, np.number)]
+    # Model & opt
+    model = LSTMTwoHead(n_feat=n_feat, hidden=args.hidden, num_layers=args.num_layers, dropout=args.dropout).to(device)
+    optim = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-    # Scale features with fit on TRAIN only; transform VA/TEST
-    scaler = StandardScaler()
-    tr.loc[:, feat_cols] = scaler.fit_transform(tr[feat_cols])
-    va.loc[:, feat_cols] = scaler.transform(va[feat_cols])
-    te.loc[:, feat_cols] = scaler.transform(te[feat_cols])
+    # Regression loss
+    if args.loss == "huber":
+        def reg_loss(pred, target):
+            return huber_loss(pred, target, beta=args.huber_beta, reduction="none").squeeze(1)
+    elif args.loss == "l1":
+        def reg_loss(pred, target):
+            return torch.abs(pred - target).squeeze(1)
+    else: # l2
+        def reg_loss(pred, target):
+            return ((pred - target) ** 2).squeeze(1)
 
-    # Build windows per split
-    Xtr, ytr = make_windows(tr, feat_cols, WINDOW)
-    Xva, yva = make_windows(va, feat_cols, WINDOW)
-    Xte, yte = make_windows(te, feat_cols, WINDOW)
+    # Class imbalance handling (pos_weight)
+    pos_weight = None
+    p_long = max(1e-6, float(ytr_long.mean()))
+    if 0 < p_long < 1:
+        pos_weight = torch.tensor([(1.0 - p_long) / p_long], dtype=torch.float32, device=device)
 
-    # Convert to tensors
-    Xtr_t = torch.from_numpy(Xtr).to(DEVICE); ytr_t = torch.from_numpy(ytr).to(DEVICE)
-    Xva_t = torch.from_numpy(Xva).to(DEVICE); yva_t = torch.from_numpy(yva).to(DEVICE)
-    Xte_t = torch.from_numpy(Xte).to(DEVICE); yte_t = torch.from_numpy(yte).to(DEVICE)
+    best_val_rmse = float("inf")
+    epochs_no_improve = 0
 
-    model = LSTMReg(in_dim=Xtr.shape[-1] if Xtr.size else len(feat_cols)).to(DEVICE)
-    opt = torch.optim.Adam(model.parameters(), lr=LR)
-    loss_fn = nn.MSELoss()
-
-    best_val = math.inf
-    best_state = None
-    bad_epochs = 0
-
-    def batch_iter(X, y, bs):
-        n = len(X)
-        idx = torch.randperm(n, device=DEVICE)
-        for i in range(0, n, bs):
-            sel = idx[i:i+bs]
-            yield X[sel], y[sel]
-
-    for ep in range(1, EPOCHS+1):
+    for epoch in range(1, args.epochs + 1):
         model.train()
-        if len(Xtr_t) > 0:
-            for xb, yb in batch_iter(Xtr_t, ytr_t, BATCH):
-                opt.zero_grad()
-                pred = model(xb)
-                loss = loss_fn(pred, yb)
-                loss.backward()
-                opt.step()
-        # validation
+        # classifier warm-up schedule: ramp 0 -> alpha_cls over warmup_epochs
+        if epoch <= args.warmup_epochs:
+            alpha_cls_now = args.alpha_cls * (epoch / max(1, args.warmup_epochs))
+        else:
+            alpha_cls_now = args.alpha_cls
+
+        epoch_loss = 0.0
+        n_seen = 0
+
+        for xb, yb_sec, yb_long in train_loader:
+            xb = xb.to(device)
+            yb_sec = yb_sec.to(device)
+            yb_long= yb_long.to(device)
+
+            optim.zero_grad()
+            logit_long, pred_sec = model(xb)
+
+            # classification loss (with optional focal)
+            loss_cls = bce_with_logits_focal(logit_long, yb_long, gamma=args.focal_gamma, pos_weight=pos_weight)
+
+            # regression loss with different weights for long/short examples
+            per_sample_reg = reg_loss(pred_sec, yb_sec)  # [B]
+            w_reg = torch.where(yb_long > 0.5,
+                                torch.tensor(args.reg_w_long, device=device),
+                                torch.tensor(args.reg_w_short, device=device))
+            loss_reg = (per_sample_reg * w_reg).mean()
+
+            loss = alpha_cls_now * loss_cls + args.alpha_reg * loss_reg
+            loss.backward()
+            optim.step()
+
+            bs = xb.size(0)
+            epoch_loss += loss.item() * bs
+            n_seen += bs
+
+        # ---- Eval on validation (in raw space) ----
         model.eval()
         with torch.no_grad():
-            if len(Xva_t) > 0:
-                pred_v = model(Xva_t).cpu().numpy()
-                yv = yva_t.cpu().numpy()
-                val_rmse = rmse(pred_v, yv)
-            else:
-                val_rmse = float("nan")
-        print(f"Epoch {ep}/{EPOCHS} - val RMSE: {val_rmse:.4f}" if not math.isnan(val_rmse) else f"Epoch {ep}/{EPOCHS} - val RMSE: nan")
+            # Full-batch eval tensors
+            Xva_t = torch.from_numpy(Xva_s).to(device)
+            Xte_t = torch.from_numpy(Xte_s).to(device)
+            logit_val, pred_val = model(Xva_t)
+            logit_te,  pred_te  = model(Xte_t)
 
-        # early stopping
-        improved = not math.isnan(val_rmse) and val_rmse < best_val - 1e-6
+            pv_sec = inv(pred_val.squeeze(1).cpu().numpy())
+            pt_sec = inv(pred_te.squeeze(1).cpu().numpy())
+            yv_exp = yva_raw
+            yt_exp = yte_raw
+
+        v_mae = mean_absolute_error(yv_exp, pv_sec)
+        v_rmse= math.sqrt(mean_squared_error(yv_exp, pv_sec))
+        v_r2  = r2_score(yv_exp, pv_sec)
+
+        t_mae = mean_absolute_error(yt_exp, pt_sec)
+        t_rmse= math.sqrt(mean_squared_error(yt_exp, pt_sec))
+        t_r2  = r2_score(yt_exp, pt_sec)
+
+        print(f"Epoch {epoch:03d} | train loss {epoch_loss/max(1,n_seen):.4f} | val MAE {v_mae:.4f} RMSE {v_rmse:.4f} R2 {v_r2:.4f}")
+
+        improved = v_rmse + 1e-9 < best_val_rmse
         if improved:
-            best_val = val_rmse
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            bad_epochs = 0
+            best_val_rmse = v_rmse
+            epochs_no_improve = 0
+            best_state = {k: v.clone() for k, v in model.state_dict().items()}
         else:
-            bad_epochs += 1
-        if bad_epochs >= PATIENCE:
-            print(f"Early stopping at epoch {ep} (best val RMSE: {best_val:.4f})")
-            break
+            epochs_no_improve += 1
+            if epochs_no_improve >= args.patience:
+                print(f"Early stopping at epoch {epoch} (best val RMSE={best_val_rmse:.4f})")
+                break
 
-    # Load best state if we have it
-    if best_state is not None:
+    # load best state
+    if 'best_state' in locals():
         model.load_state_dict(best_state)
 
-    # Final test evaluation
+    # ---- Final Eval + Export ----
     model.eval()
     with torch.no_grad():
-        if len(Xte_t) > 0:
-            pred_t = model(Xte_t).cpu().numpy()
-            yt = yte_t.cpu().numpy()
-            test_rmse = rmse(pred_t, yt)
-        else:
-            test_rmse = float("nan")
+        Xva_t = torch.from_numpy(Xva_s).to(device)
+        Xte_t = torch.from_numpy(Xte_s).to(device)
 
-    # Save model + metrics
-    Path("outputs").mkdir(exist_ok=True, parents=True)
-    torch.save(model.state_dict(), "outputs/model_lstm.pt")
-joblib.dump(scaler, "outputs/lstm_scaler.joblib")
-with open("outputs/lstm_features.txt","w") as f:
-    f.write("\n".join(feat_cols))
-    lines = [
-        "# LSTM Metrics",
-        "",
-        f"- Best Validation RMSE: {best_val:.6f}",
-        f"- Test RMSE: {test_rmse:.6f}",
-        f"- Window: {WINDOW}, Hidden: 128, Batch: {BATCH}, LR: {LR}, Patience: {PATIENCE}",
-        f"- Device: {DEVICE}",
-        f"- Train windows: {len(Xtr)}, Val windows: {len(Xva)}, Test windows: {len(Xte)}"
-    ]
-    Path("outputs/lstm_metrics.md").write_text("\n".join(lines))
-    print("Saved outputs/model_lstm.pt and outputs/lstm_metrics.md")
+        logit_val, pred_val = model(Xva_t)
+        logit_te,  pred_te  = model(Xte_t)
+
+        pv_sec = inv(pred_val.squeeze(1).cpu().numpy())
+        pt_sec = inv(pred_te.squeeze(1).cpu().numpy())
+        yv_exp = yva_raw
+        yt_exp = yte_raw
+
+        pv_prob = torch.sigmoid(logit_val).squeeze(1).cpu().numpy()
+        pt_prob = torch.sigmoid(logit_te).squeeze(1).cpu().numpy()
+
+    # Metrics tables
+    val_tbl = pd.DataFrame({"MAE":[mean_absolute_error(yv_exp, pv_sec)],
+                            "RMSE":[math.sqrt(mean_squared_error(yv_exp, pv_sec))],
+                            "R2":[r2_score(yv_exp, pv_sec)]})
+    test_tbl= pd.DataFrame({"MAE":[mean_absolute_error(yt_exp, pt_sec)],
+                            "RMSE":[math.sqrt(mean_squared_error(yt_exp, pt_sec))],
+                            "R2":[r2_score(yt_exp, pt_sec)]})
+    print("\nValidation:\n", val_tbl)
+    print("\nTest:\n", test_tbl)
+
+    # Build row-wise export with identifiers
+    def last_rows(df_split):
+        # return the last row (target row) for each rolling window
+        # build matching index to (A,B,C,split) of the target rows
+        rows = []
+        for i in range(len(df_split) - seq_len + 1):
+            rows.append(df_split.iloc[i+seq_len-1][["A","B","C","split"]])
+        return pd.DataFrame(rows)
+
+    val_rows  = last_rows(val_df)
+    test_rows = last_rows(test_df)
+
+    val_out = val_rows.copy()
+    val_out["true_sec"] = yv_exp
+    val_out["pred_sec"] = pv_sec
+    val_out["pred_long_prob"] = pv_prob
+
+    test_out = test_rows.copy()
+    test_out["true_sec"] = yt_exp
+    test_out["pred_sec"] = pt_sec
+    test_out["pred_long_prob"] = pt_prob
+
+    export = pd.concat([val_out, test_out], ignore_index=True)
+    Path("outputs").mkdir(parents=True, exist_ok=True)
+    export.to_csv("outputs/lstm_predictions.csv", index=False)
+    print("Wrote per-row predictions -> outputs/lstm_predictions.csv")
+
+    # Save model + small report
+    torch.save(model.state_dict(), "outputs/lstm_cycle_time.pt")
+    with open("outputs/metrics_report_lstm.md","w") as f:
+        f.write("# LSTM Two-Head Report\n")
+        f.write(f"- Timestamp: {dt.datetime.utcnow().isoformat()}Z\n")
+        f.write(f"- Val: MAE={val_tbl.MAE.iloc[0]:.4f}, RMSE={val_tbl.RMSE.iloc[0]:.4f}, R2={val_tbl.R2.iloc[0]:.4f}\n")
+        f.write(f"- Test: MAE={test_tbl.MAE.iloc[0]:.4f}, RMSE={test_tbl.RMSE.iloc[0]:.4f}, R2={test_tbl.R2.iloc[0]:.4f}\n")
+
+    print("\nSaved model -> outputs/lstm_cycle_time.pt")
+    print("Wrote report -> outputs/metrics_report_lstm.md")
+
 
 if __name__ == "__main__":
     main()

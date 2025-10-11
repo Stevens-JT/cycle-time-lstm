@@ -10,6 +10,7 @@ baselines:
 
 lstm:
 	$(PY) src/train_lstm.py
+        #\tpython src/train_lstm.py --seq_len 5 --hidden 64 --layers 1 --dropout 0.1 --epochs 60 --batch_size 128 --lr 1e-3 --patience 10
 
 inference-baseline:
 	$(PY) src/inference.py --model baseline
