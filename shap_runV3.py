@@ -60,227 +60,7 @@ class LSTMRegMTL(nn.Module):
         y_cls = self.head_cls(h)
         return (y_reg, y_cls) if task == "both" else y_cls
 
-# ---------------------------------------------------------------------
-# Utilities
-# ---------------------------------------------------------------------
-def load_features_df(path: Path) -> pd.DataFrame:
-    if not path.exists():
-        raise FileNotFoundError(f"Features parquet not found: {path}")
-    return pd.read_parquet(path)
 
-def load_scaler_artifact(path):
-    obj = joblib.load(path)
-    if hasattr(obj, "transform") and hasattr(obj, "fit"):
-        return obj, None, None
-    if isinstance(obj, dict):
-        mu = np.asarray(obj.get("mean"), dtype=np.float32)
-        std = np.asarray(obj.get("std"), dtype=np.float32)
-        return None, mu, std
-    raise TypeError(f"Unsupported scaler artifact type: {type(obj)}")
-
-def get_feature_cols_numeric(df: pd.DataFrame, target_col: str, exclude_extra: list[str]) -> list[str]:
-    exclude = set([target_col] + exclude_extra)
-    present = [c for c in df.columns if c not in exclude]
-    numeric = list(df[present].select_dtypes(include=[np.number]).columns)
-    if not numeric:
-        raise ValueError("No numeric feature columns found after exclusions.")
-    return numeric
-
-def build_windows_global(df: pd.DataFrame, feat_cols: list[str], window: int, order_col: str, target_col: str):
-    """Build rolling windows globally (no per-ID grouping)."""
-    if len(df) < window + 1:
-        raise ValueError(f"Not enough rows to form windows globally (need ≥ {window+1}, got {len(df)}).")
-    df = df.sort_values(order_col).reset_index(drop=True)
-    Xs, ys = [], []
-    vals = df[feat_cols].values.astype("float32")
-    tgt  = df[target_col].values.astype("float32")
-    for i in range(len(df) - window):
-        Xs.append(vals[i:i+window])
-        ys.append(tgt[i+window])
-    return np.stack(Xs, axis=0), np.asarray(ys, dtype="float32")
-
-def per_timestep_impute_scale(Xseq, scaler=None, mu=None, std=None):
-    N, T, F = Xseq.shape
-    if scaler is not None:
-        for t in range(T):
-            Xt = Xseq[:, t, :]
-            Xt[~np.isfinite(Xt)] = np.nan
-            col_mean = np.nanmean(Xt, axis=0)
-            inds = np.where(~np.isfinite(Xt))
-            if inds[0].size:
-                Xt[inds] = np.take(col_mean, inds[1])
-            Xseq[:, t, :] = scaler.transform(Xt)
-        return Xseq.astype(np.float32)
-    if mu is None or std is None:
-        raise ValueError("Need either sklearn scaler or (mu,std) arrays.")
-    std_safe = np.maximum(std, 1e-8)
-    MU  = np.broadcast_to(mu,  (N, T, F))
-    STD = np.broadcast_to(std_safe, (N, T, F))
-    X = Xseq.copy()
-    X[~np.isfinite(X)] = np.nan
-    nan_mask = np.isnan(X)
-    if nan_mask.any():
-        X[nan_mask] = MU[nan_mask]
-    X = (X - MU) / STD
-    return X.astype(np.float32)
-
-# ---------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--window", type=int, default=10)
-    ap.add_argument("--mode", choices=["pre","post"], default="pre",
-                    help="pre: feature selection; post: explain LSTM predictions")
-    args = ap.parse_args()
-
-    OUT_DIR = Path(f"outputs/shap_{args.mode}")
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    FEATURES_PARQUET = Path("outputs/features_spark.parquet")
-    SCALER_PATH      = Path("outputs/lstm_scaler.joblib")
-    MODEL_PATH       = Path("outputs/lstm_cycle_time.pt")
-    FEATS_TXT        = Path("outputs/lstm_features.txt")
-
-    TARGET = "CycleTime_sec"
-    df = load_features_df(FEATURES_PARQUET).copy()
-    df = df.dropna(subset=[TARGET])
-
-    # pick an ordering column: prefer C (timestamp), else B, else index
-    if "C" in df.columns:
-        ORDER_COL = "C"
-        try:
-            df["C"] = pd.to_datetime(df["C"])
-        except Exception:
-            pass
-    elif "B" in df.columns:
-        ORDER_COL = "B"
-    else:
-        ORDER_COL = "__row__"
-        df[ORDER_COL] = np.arange(len(df))
-
-    # feature list (numeric only; exclude obvious non-features if present)
-    exclude_extra = ["A","B","C","D","split","next_ts","cycle_timestamp","timestamp","serial_id","cycle_number"]
-    if FEATS_TXT.exists():
-        feat_cols = [ln.strip() for ln in FEATS_TXT.read_text().splitlines() if ln.strip() and ln.strip() in df.columns]
-    else:
-        feat_cols = get_feature_cols_numeric(df, TARGET, exclude_extra)
-
-    # build global windows
-    Xseq, y = build_windows_global(df, feat_cols, args.window, ORDER_COL, TARGET)
-
-    # load scaler artifact and per-timestep scale
-    scaler, mu_art, std_art = load_scaler_artifact(SCALER_PATH)
-    Xseq = per_timestep_impute_scale(Xseq, scaler=scaler, mu=mu_art, std=std_art)
-
-    # last-timestep features for SHAP space
-    X_last = Xseq[:, -1, :]  # [N, F]
-
-    # POST mode: load LSTM and get its predictions (ŷ) for windows
-    if args.mode == "post":
-        state = torch.load(MODEL_PATH, map_location="cpu")
-        input_ckpt = int(state["lstm.weight_ih_l0"].shape[1])
-        hidden_ckpt = int(state["lstm.weight_ih_l0"].shape[0] // 4)
-
-        # align F to checkpoint input size if needed
-        if Xseq.shape[-1] != input_ckpt:
-            # if feature list file exists, enforce its order and truncate/pad
-            if FEATS_TXT.exists():
-                trained = [ln.strip() for ln in FEATS_TXT.read_text().splitlines() if ln.strip() in df.columns]
-                if len(trained) >= input_ckpt:
-                    feat_cols = trained[:input_ckpt]
-                else:
-                    feat_cols = (trained + feat_cols)[:input_ckpt]
-                # rebuild windows + scale with aligned features
-                Xseq, y = build_windows_global(df, feat_cols, args.window, ORDER_COL, TARGET)
-                Xseq = per_timestep_impute_scale(Xseq, scaler=scaler, mu=mu_art, std=std_art)
-                X_last = Xseq[:, -1, :]
-            else:
-                # simple truncate/pad
-                F = Xseq.shape[-1]
-                if F >= input_ckpt:
-                    Xseq = Xseq[:, :, :input_ckpt]
-                    X_last = X_last[:, :input_ckpt]
-                else:
-                    pad = np.zeros((Xseq.shape[0], Xseq.shape[1], input_ckpt - F), dtype=Xseq.dtype)
-                    Xseq = np.concatenate([Xseq, pad], axis=-1)
-                    pad2 = np.zeros((X_last.shape[0], input_ckpt - F), dtype=X_last.dtype)
-                    X_last = np.concatenate([X_last, pad2], axis=-1)
-
-        # define model, prune cls head if present
-        class LSTMRegMTL(nn.Module):
-            def __init__(self, in_dim, hidden=64, reg_width=64, has_cls=False, cls_width=64):
-                super().__init__()
-                self.lstm = nn.LSTM(in_dim, hidden, num_layers=1, batch_first=True)
-                self.head_reg = nn.Sequential(nn.Linear(hidden, reg_width), nn.ReLU(), nn.Linear(reg_width, 1))
-                self.has_cls = has_cls
-                if has_cls:
-                    self.head_cls = nn.Sequential(nn.Linear(hidden, cls_width), nn.ReLU(), nn.Linear(cls_width, 1))
-            def forward(self, x):
-                out, _ = self.lstm(x)
-                h = out[:, -1, :]
-                return self.head_reg(h)
-
-        has_cls = any(k.startswith("head_cls.") for k in state.keys())
-        model = LSTMRegMTL(in_dim=input_ckpt, hidden=hidden_ckpt, has_cls=has_cls)
-        state_pruned = {k: v for k, v in state.items() if not k.startswith("head_cls.")}
-        _ = model.load_state_dict(state_pruned, strict=False)
-        model.eval()
-
-        with torch.no_grad():
-            y_hat = model(torch.from_numpy(Xseq)).squeeze(1).numpy()
-    else:
-        y_hat = None  # pre mode uses true y
-
-    # ---- SHAP: train surrogate on X_last -> target_to_explain ----
-    if not HAVE_SHAP:
-        print("⚠️  SHAP not installed. Run: pip install shap matplotlib")
-        sys.exit(0)
-
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from sklearn.linear_model import Ridge
-
-    if args.mode == "pre":
-        target_to_explain = y
-        print("\n[INFO] PRE mode: explaining true target (feature selection)")
-    else:
-        target_to_explain = y_hat
-        print("\n[INFO] POST mode: explaining LSTM predictions (model explainability)")
-
-    # small surrogate for KernelExplainer stability/speed
-    ridge = Ridge(alpha=1.0).fit(X_last, target_to_explain)
-
-    # background + sample (keep it quick)
-    n_bg = min(200, len(X_last))
-    n_sm = min(1000, len(X_last))
-    bg_idx = np.random.choice(len(X_last), size=n_bg, replace=False)
-    sm_idx = np.random.choice(len(X_last), size=n_sm, replace=False)
-    background = X_last[bg_idx]
-    X_sample  = X_last[sm_idx]
-
-    explainer = shap.KernelExplainer(ridge.predict, background)
-    shap_values = explainer.shap_values(X_sample, nsamples="auto")
-
-    # plots
-    plt.figure()
-    shap.summary_plot(shap_values, X_sample, feature_names=feat_cols[:X_sample.shape[1]], plot_type="bar", show=False)
-    plt.tight_layout()
-    plt.savefig(OUT_DIR / "shap_summary_bar.png", dpi=200, bbox_inches="tight")
-    plt.close()
-
-    plt.figure()
-    shap.summary_plot(shap_values, X_sample, feature_names=feat_cols[:X_sample.shape[1]], show=False)
-    plt.tight_layout()
-    plt.savefig(OUT_DIR / "shap_beeswarm.png", dpi=200, bbox_inches="tight")
-    plt.close()
-
-    print(f"\n✅ SHAP {args.mode} artifacts saved to {OUT_DIR.resolve()}")
-    print("   - shap_summary_bar.png")
-    print("   - shap_beeswarm.png")
-
-'''
 # ---------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------
@@ -309,7 +89,7 @@ def get_initial_feat_cols(df: pd.DataFrame, TARGET, ID, ORDER) -> list:
         raise ValueError("No numeric feature columns found.")
     return numeric
 
-
+'''
 def window_lastW(groups: dict, feat_cols: list, window: int, ORDER, ID, TARGET):
     Xs, ys = [], []
     for sid, g in groups.items():
@@ -327,7 +107,7 @@ def window_lastW(groups: dict, feat_cols: list, window: int, ORDER, ID, TARGET):
             f"Groups checked: {len(groups)}."
         )
     return np.stack(Xs, axis=0), np.asarray(ys, dtype="float32")
-
+'''
 
 def window_lastW(groups: dict, feat_cols: list, window: int, ORDER, ID, TARGET):
     Xs, ys = [], []
@@ -514,7 +294,7 @@ def main():
     print("Files:")
     print(" - shap_summary_bar.png")
     print(" - shap_beeswarm.png\n")
-'''
+
 
 if __name__ == "__main__":
     main()
