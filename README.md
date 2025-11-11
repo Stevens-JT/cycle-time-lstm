@@ -80,6 +80,51 @@ cycle-time/
      - `timestamp_column:` (e.g., `cycle_timestamp`)
      - `good_bad_label_column:` (kept but **not used** for training)
 
+  **SHAP Feature Selection and Explainability **
+  - Pre-training: set OUT_DIR = Path("outputs/shap_pre")
+  - Post-training: set OUT_DIR = Path("outputs/shap_post")
+    - Inputs required:
+      - outputs/features_spark.parquet (from make etl)
+      - For post-training: outputs/lstm_cycle_time.pt, outputs/lstm_scaler.joblib, outputs/lstm_features.txt (from make lstm)
+  Pre-training feature selection
+  1) Open shap_run.py and set:
+    - OUT_DIR = Path("outputs/shap_pre")
+  2) Run (window is only used to keep interface consistent; pre-selection operates on tabular train features):
+    - python shap_run.py --window 10
+
+  Artifacts (in outputs/shap_pre/):
+
+    - top_features.csv — ranked features by mean |SHAP| (use top-K for training)
+
+    - dataset_stats.csv — row/feature counts per split + target stats
+
+    - shap_summary_bar.png — bar chart of mean |SHAP|
+
+    - shap_beeswarm.png — distribution of SHAP values per feature
+
+    - shap_dependence_1.png, shap_dependence_2.png, … — dependence plots for top features
+
+    How to use it
+
+      1) Open outputs/top_features.csv and select top-K features (e.g., 50).
+
+      2) Save/update outputs/lstm_features.txt with one feature name per line.
+
+      3) Retrain the LSTM:
+        - make lstm
+  Post-training explainability
+    1) Train the LSTM (writes model + scaler + feature list):
+      - make lstm
+    2) Open shap_run.py and set:
+      - OUT_DIR = Path("outputs/shap_post")
+    3) Run with the same sequence length used in training (the script will read it from the scaler when available, but pass it to be explicit):
+      - python shap_run.py --window 10
+    The script will:
+      - Load outputs/lstm_cycle_time.pt
+      - Load outputs/lstm_scaler.joblib (contains mean, std, feature_cols, seq_len)
+      - Build windows per the training feature list
+      - Produce timestep-aware SHAP plots
+
 ---
 
 ## 🏃‍♀️ Run the Pipeline

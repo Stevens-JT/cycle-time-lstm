@@ -5,6 +5,7 @@ import math
 import os
 from pathlib import Path
 
+import joblib
 import numpy as np
 import pandas as pd
 import torch
@@ -98,6 +99,20 @@ def build_sequences(df, seq_len, feature_cols):
     y = np.array(y, dtype=np.float32)  # [N]
     return X, y
 
+
+'''
+def build_sequences_grouped(df, seq_len, feature_cols, id_col="A"):
+    X, y = []
+    for sid, g in df.sort_values(["C"]).groupby(id_col):
+        g = g.sort_values("C")
+        for i in range(len(g) - seq_len + 1):
+            win = g.iloc[i:i+seq_len]
+            tgt = g.iloc[i+seq_len-1]["CycleTime_sec"]
+            X.append(win[feature_cols].values)
+            y.append(tgt)
+    return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
+'''
+
 def standardize(train_arr, *others):
     mean = train_arr.mean(axis=(0,1), keepdims=True)
     std  = train_arr.std(axis=(0,1), keepdims=True) + 1e-8
@@ -157,6 +172,16 @@ def main():
     n_feat = len(feature_cols)
     print(f"# Feature columns: {n_feat}")
 
+    feats_txt = Path("outputs/lstm_features.txt")
+    if feats_txt.exists():
+        selected = [ln.strip() for ln in feats_txt.read_text().splitlines() if ln.strip()]
+        missing = [c for c in selected if c not in df.columns]
+    if missing:
+        print(f"[WARN] Selected features missing in dataframe: {missing}")
+    feature_cols = [c for c in selected if c in df.columns]
+    n_feat = len(feature_cols)
+    print(f"[FS] Using {n_feat} selected features from outputs/lstm_features.txt")
+
     # Build sequences per split
     seq_len = args.seq_len
     train_df = df[df["split"]=="train"].copy().sort_values("C")
@@ -166,6 +191,9 @@ def main():
     Xtr, ytr = build_sequences(train_df, seq_len, feature_cols)
     Xva, yva = build_sequences(val_df,   seq_len, feature_cols)
     Xte, yte = build_sequences(test_df,  seq_len, feature_cols)
+    #Xtr, ytr = build_sequences_grouped(train_df, seq_len, feature_cols)
+    #Xva, yva = build_sequences_grouped(val_df,   seq_len, feature_cols)
+    #Xte, yte = build_sequences_grouped(test_df,  seq_len, feature_cols)
 
     # Save raw y (seconds) for export metrics
     ytr_raw = ytr.copy()
@@ -180,7 +208,82 @@ def main():
     print(f"Train long-rate (>={thr}s): {ytr_long.mean():.4f}")
 
     # Standardize inputs based on TRAIN only
-    Xtr_s, Xva_s, Xte_s = standardize(Xtr, Xva, Xte)
+    #Xtr_s, Xva_s, Xte_s = standardize(Xtr, Xva, Xte)
+
+    # --- Compute train-only mean/std and apply to all splits; also SAVE scaler + features ---
+    '''
+    mu = Xtr.mean(axis=(0, 1), keepdims=True)                           # shape [1,1,F]
+    sigma = Xtr.std(axis=(0, 1), keepdims=True) + 1e-8                  # shape [1,1,F]
+
+    def apply_standardize(arr, mu, sigma):
+        return (arr - mu) / sigma
+
+    Xtr_s = apply_standardize(Xtr, mu, sigma)
+    Xva_s = apply_standardize(Xva, mu, sigma)
+    Xte_s = apply_standardize(Xte, mu, sigma)
+
+    # Persist the scaler + feature list for inference/SHAP reproducibility
+    Path("outputs").mkdir(parents=True, exist_ok=True)
+    scaler_art = {
+        "mean": mu.squeeze().astype(np.float32),   # shape [F]
+        "std":  sigma.squeeze().astype(np.float32),# shape [F]
+        "feature_cols": feature_cols,
+        "seq_len": seq_len,
+    }
+    joblib.dump(scaler_art, "outputs/lstm_scaler.joblib")
+    Path("outputs/lstm_features.txt").write_text("\n".join(feature_cols) + "\n", encoding="utf-8")
+    print("[OK] Saved scaler -> outputs/lstm_scaler.joblib and feature list -> outputs/lstm_features.txt")
+    '''
+
+    # --- Impute NaNs using TRAIN means (per feature), then standardize ---
+    # Compute per-feature means over train (across all timesteps/samples), ignoring NaNs
+    train_means = np.nanmean(Xtr, axis=(0, 1), keepdims=True)  # shape [1,1,F]
+    # If a feature is entirely NaN in train, fall back to 0
+    train_means = np.where(np.isfinite(train_means), train_means, 0.0).astype(np.float32)
+
+    def impute_with(train_means, arr):
+        out = arr.copy()
+        # Replace inf with nan so we can impute them too
+        out[~np.isfinite(out)] = np.nan
+        mask = np.isnan(out)
+        if mask.any():
+            # broadcast train_means to arr shape and plug values where mask
+            out[mask] = np.broadcast_to(train_means, out.shape)[mask]
+        return out
+
+    Xtr = impute_with(train_means, Xtr)
+    Xva = impute_with(train_means, Xva)
+    Xte = impute_with(train_means, Xte)
+
+    # Compute train-only mean/std AFTER imputation
+    mu    = Xtr.mean(axis=(0, 1), keepdims=True)
+    sigma = Xtr.std(axis=(0, 1), keepdims=True)
+    sigma = np.where(sigma < 1e-8, 1e-8, sigma).astype(np.float32)
+
+    def apply_standardize(arr, mu, sigma):
+        return (arr - mu) / sigma
+
+    Xtr_s = apply_standardize(Xtr, mu, sigma)
+    Xva_s = apply_standardize(Xva, mu, sigma)
+    Xte_s = apply_standardize(Xte, mu, sigma)
+
+    # Persist the scaler + feature list for inference/SHAP
+    Path("outputs").mkdir(parents=True, exist_ok=True)
+    scaler_art = {
+        "mean":  mu.squeeze().astype(np.float32),      # [F]
+        "std":   sigma.squeeze().astype(np.float32),   # [F]
+        "train_means": train_means.squeeze().astype(np.float32),  # [F], for completeness
+        "feature_cols": feature_cols,
+        "seq_len": seq_len,
+    }
+    joblib.dump(scaler_art, "outputs/lstm_scaler.joblib")
+    Path("outputs/lstm_features.txt").write_text("\n".join(feature_cols) + "\n", encoding="utf-8")
+    print("[OK] Saved scaler -> outputs/lstm_scaler.joblib and feature list -> outputs/lstm_features.txt")
+
+    # Sanity checks
+    assert np.isfinite(Xtr_s).all(), "Xtr_s contains non-finite values"
+    assert np.isfinite(Xva_s).all(), "Xva_s contains non-finite values"
+    assert np.isfinite(Xte_s).all(), "Xte_s contains non-finite values"
 
     # Optionally transform targets (log1p)
     if args.log_target:
@@ -211,6 +314,7 @@ def main():
     # Model & opt
     model = LSTMTwoHead(n_feat=n_feat, hidden=args.hidden, num_layers=args.num_layers, dropout=args.dropout).to(device)
     optim = torch.optim.Adam(model.parameters(), lr=1e-3)
+    print(f"[MODEL] Input features (F) = {n_feat}, seq_len = {seq_len}, hidden = {args.hidden}")
 
     # Regression loss
     if args.loss == "huber":

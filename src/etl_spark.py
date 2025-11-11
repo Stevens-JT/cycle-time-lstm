@@ -232,6 +232,27 @@ def main():
     spark.stop()
     print(f"Wrote raw to {raw_out} and features to {feat_out}")
 
+    # Emit the deterministic feature list used for modeling
+    TARGET = "CycleTime_sec"
+    exclude = {TARGET, "split", "cycle_timestamp"}
+    if id_col:  exclude.add(id_col)
+    if cyc_col: exclude.add(cyc_col)
+
+    # Keep only non-excluded, numeric columns in a stable order
+    #feat_cols = [c for c in final.columns if c not in exclude]
+    numeric_types = {"double", "float", "int", "bigint", "long"}
+    feat_cols = [c for (c, t) in final.dtypes if c not in exclude and t in numeric_types]
+
+    # numeric_types = {"double", "float", "int", "bigint"}
+    # feat_cols = [c for c, t in final.dtypes if c not in exclude and t in numeric_types]
+
+    Path("outputs").mkdir(parents=True, exist_ok=True)
+    with open("outputs/lstm_features.txt", "w") as f:
+        for c in feat_cols:
+            f.write(c + "\n")
+
+    print(f"Wrote outputs/lstm_features.txt with {len(feat_cols)} features.")
+
 
 if __name__ == "__main__":
     main()
