@@ -1,5 +1,4 @@
 # src/etl_spark.py
-import sys
 import yaml
 import importlib.util
 from pathlib import Path
@@ -10,7 +9,7 @@ from pyspark.sql.types import ArrayType, DoubleType
 
 
 def summarize_vector(col_arr):
-    """Vector-wise summaries for a single channel (array<double>)."""
+    # vector-wise summaries for a single channel (array<double>)
     return {
         "len": F.size(col_arr),
         "min": F.array_min(col_arr),
@@ -40,16 +39,12 @@ def summarize_vector(col_arr):
 
 
 def summarize_ts_column(df, colname, parse_udf):
-    """
-    parse -> explode channels -> per-channel stats -> aggregate (mean across channels)
-    Produces columns like E_len_mean, E_max_mean, E_sum_mean, E_slope_mean, ...
-    """
+    # parse -> explode channels -> aggregate summaries (mean across channels)
     parsed = df.withColumn(f"{colname}__parsed", parse_udf(F.col(colname)))
     exploded = parsed.withColumn(
         f"{colname}__ch", F.explode_outer(F.col(f"{colname}__parsed"))
     )
     feats = summarize_vector(F.col(f"{colname}__ch"))
-
     # group by everything *except* the original raw TS column
     group_keys = [c for c in df.columns if c != colname]
     agg = exploded.groupBy(*group_keys).agg(
@@ -74,7 +69,7 @@ def main():
     with open("config.yaml", "r") as f:
         cfg = yaml.safe_load(f)
 
-    ts_cols = cfg["time_series_columns"]            # list of raw TS columns (arrays)
+    ts_cols = cfg["time_series_columns"]            # 12 TS columns (arrays)
     id_col  = cfg.get("id_column")                  # "A"
     cyc_col = cfg.get("cycle_number_column")        # "B"
     ts_time = cfg["timestamp_column"]               # "C"
@@ -87,14 +82,13 @@ def main():
     # Spark session
     # -------------------
     spark = (
-        SparkSession.builder
-        .appName("CycleTimeETL")
+        SparkSession.builder.appName("CycleTimeETL")
         .getOrCreate()
     )
     spark.conf.set("spark.sql.ansi.enabled", "false")
 
     # -------------------
-    # Ship utils.py to workers & register UDFs
+    # Ship utils.py to workers & register UDFs *after* shipping
     # -------------------
     utils_path = Path(__file__).parent / "utils.py"
     spark.sparkContext.addPyFile(str(utils_path))
@@ -157,32 +151,14 @@ def main():
     )
 
     # -------------------
-    # PERSIST RAW (no cycle-time filtering yet) + round-trip check
+    # PERSIST RAW (no cycle-time filtering yet)
     # -------------------
+    # This preserves original A/B/C values so you can always cross-check
     df_sorted.write.mode("overwrite").parquet(raw_out)
 
-    # === STORAGE/RETRIEVAL LOGGING: RAW ===
-    try:
-        raw_rt = spark.read.parquet(raw_out)
-        raw_written = df_sorted.count()
-        raw_roundtrip = raw_rt.count()
-        print(f"[RAW] wrote -> {raw_out}")
-        print(f"[RAW] rows (written): {raw_written} | rows (round-trip): {raw_roundtrip} | match: {raw_written == raw_roundtrip}")
-        # Light sample: A(id), B(cycle), C(timestamp), split
-        show_id = id_col if id_col and id_col in raw_rt.columns else "A"
-        show_cy = cyc_col if cyc_col and cyc_col in raw_rt.columns else "B"
-        show_ts = ts_time if ts_time in raw_rt.columns else "C"
-        raw_rt.select(
-            F.col(show_id).alias("serial_id"),
-            F.col(show_cy).alias("cycle_number"),
-            F.col(show_ts).alias("timestamp"),
-            "split"
-        ).orderBy(F.col(show_cy).cast("long")).show(5, truncate=False)
-    except Exception as e:
-        print(f"[RAW] round-trip check failed: {e}", file=sys.stderr)
-
     # -------------------
-    # Cycle time on a copy (STRICT: next cycle == current+1)
+    # Cycle time: compute on a COPY (df_ct), do not mutate raw
+    # STRICT rule: only when next cycle = current+1 (no time-only fallback)
     # -------------------
     order_expr = F.when(
         F.col(cyc_col).isNotNull(), F.col(cyc_col).cast("long")
@@ -219,7 +195,7 @@ def main():
     # Filter to rows with valid target for modeling/features
     df_model = df_ct.filter(F.col("CycleTime_sec").isNotNull())
 
-    # Quick sanity logs
+    # Some quick sanity logs
     print("DEBUG total rows (raw, parsed):", df_sorted.count())
     print("DEBUG model rows (with valid CycleTime_sec):", df_model.count())
     gt = df_model.groupBy().agg(F.max("CycleTime_sec").alias("max_ct")).first()
@@ -243,10 +219,9 @@ def main():
     # Persist features + data dictionary
     # -------------------
     final.write.mode("overwrite").parquet(feat_out)
-    print(f"Wrote raw to {raw_out} and features to {feat_out}")
 
-    Path("outputs").mkdir(parents=True, exist_ok=True)
     rows = [f"| {name} | {dtype} |" for name, dtype in final.dtypes]
+    Path("outputs").mkdir(parents=True, exist_ok=True)
     with open("outputs/data_dictionary.md", "w") as f:
         f.write(
             "\n".join(
@@ -254,62 +229,29 @@ def main():
             )
         )
 
-    # === STORAGE/RETRIEVAL LOGGING: FEATURES ===
-    try:
-        feat_written = final.count()
-        rt = spark.read.parquet(feat_out)
-        feat_roundtrip = rt.count()
-        print(f"[FEATURES] wrote -> {feat_out}")
-        print(f"[FEATURES] rows (written): {feat_written} | rows (round-trip): {feat_roundtrip} | match: {feat_written == feat_roundtrip}")
-        # Light sample
-        show_id = id_col if id_col and id_col in rt.columns else "A"
-        show_cy = cyc_col if cyc_col and cyc_col in rt.columns else "B"
-        rt.select(
-            F.col(show_id).alias("serial_id"),
-            F.col(show_cy).alias("cycle_number"),
-            F.col("CycleTime_sec")
-        ).orderBy(F.col(show_cy).cast("long")).show(5, truncate=False)
-    except Exception as e:
-        print(f"[FEATURES] round-trip check failed: {e}", file=sys.stderr)
+    spark.stop()
+    print(f"Wrote raw to {raw_out} and features to {feat_out}")
 
-    # === SPARK SQL VERIFICATION (cache + aggregate) ===
-    try:
-        rt.createOrReplaceTempView("features")
-        spark.sql("CACHE TABLE features")
-        res = spark.sql("""
-          SELECT split, AVG(CycleTime_sec) AS avg_cycle, COUNT(*) AS n
-          FROM features
-          GROUP BY split
-          ORDER BY split
-        """)
-        print("[SQL] Aggregation over cached 'features':")
-        res.show(truncate=False)
-    except Exception as e:
-        print(f"[SQL] cache/aggregate failed: {e}", file=sys.stderr)
-
-    # -------------------
-    # Emit deterministic feature list for modeling
-    # -------------------
+    # Emit the deterministic feature list used for modeling
     TARGET = "CycleTime_sec"
     exclude = {TARGET, "split", "cycle_timestamp"}
-    if id_col:
-        exclude.add(id_col)
-    if cyc_col:
-        exclude.add(cyc_col)
+    if id_col:  exclude.add(id_col)
+    if cyc_col: exclude.add(cyc_col)
 
+    # Keep only non-excluded, numeric columns in a stable order
+    #feat_cols = [c for c in final.columns if c not in exclude]
     numeric_types = {"double", "float", "int", "bigint", "long"}
     feat_cols = [c for (c, t) in final.dtypes if c not in exclude and t in numeric_types]
 
+    # numeric_types = {"double", "float", "int", "bigint"}
+    # feat_cols = [c for c, t in final.dtypes if c not in exclude and t in numeric_types]
+
+    Path("outputs").mkdir(parents=True, exist_ok=True)
     with open("outputs/lstm_features.txt", "w") as f:
         for c in feat_cols:
             f.write(c + "\n")
 
     print(f"Wrote outputs/lstm_features.txt with {len(feat_cols)} features.")
-
-    # -------------------
-    # Stop Spark AFTER all retrieval/logging
-    # -------------------
-    spark.stop()
 
 
 if __name__ == "__main__":
