@@ -1,13 +1,61 @@
 # Cycle Time Prediction (PySpark + PyTorch)
 
-End-to-end project for **cycle time prediction** on manufacturing data using **local PySpark** for ETL and **PyTorch/scikit-learn** for modeling.
-Designed to complete Weeks 1–8 deliverables rapidly while satisfying a **Big Data** requirement via Spark.
+**TL;DR**  
+Production-oriented time-series ML pipeline that predicts **next-cycle manufacturing cycle times** using **Spark-based ETL**, **LSTM sequence modeling (PyTorch)**, strict **time-aware train/validation/test splits**, and **SHAP explainability** to validate model behavior under real operational constraints.
+
+---
+
+## Overview
+
+This project implements an end-to-end machine learning workflow for **predicting the next cycle time** of a real manufacturing process using historical time-series process data. Cycle time is a primary driver of **throughput, capacity planning, and scheduling**, particularly in processes such as injection molding where small temporal variations can compound into significant production inefficiencies.
+
+The system is intentionally designed to reflect **deployment realities**, including:
+- Leakage-safe temporal splits instead of random sampling  
+- A clear separation between ETL, modeling, and inference  
+- Reproducible training and inference pipelines  
+- Model explainability aligned with domain intuition  
+
+While developed in an academic setting, the emphasis throughout is on **operational relevance and production realism**, not classroom optimization.
+
+## 🧠 Modeling Decisions & Tradeoffs
+
+### Why next-cycle prediction?
+Rather than forecasting an arbitrary future horizon, this project predicts the **next-cycle time**, which:
+- Aligns naturally with real-time manufacturing workflows
+- Enables rolling inference as each cycle completes
+- Avoids compounding uncertainty common in long-horizon forecasts
+
+This framing makes the model directly usable for **scheduling, capacity planning, and process monitoring**.
+
+### Why sequence modeling (LSTM)?
+Cycle time is influenced by **temporal dependencies across prior cycles** (e.g., thermal effects, material behavior, machine state).  
+An LSTM-based sequence model was chosen to:
+- Capture short- and mid-range temporal dependencies
+- Handle noisy, non-stationary operational signals
+- Provide a strong, interpretable baseline for future sequence model comparisons
+
+### Why time-based splits instead of random splits?
+Random splits introduce **look-ahead leakage** in time-series data.  
+This project enforces **strict timestamp-based train/validation/test splits** to simulate deployment-time performance and produce honest generalization estimates.
+
+### Why Spark for ETL if the data fits locally?
+Spark is used intentionally to:
+- Mirror production ETL patterns
+- Enable scalable aggregation across multichannel sensor arrays
+- Maintain a clean separation between data engineering and modeling layers
+
+### Explainability considerations
+Model explainability is handled using **SHAP**, applied:
+- **Pre-training** for feature selection
+- **Post-training** to validate learned feature importance
+
+This helps ensure the model’s behavior aligns with **domain intuition**, not just predictive performance.
 
 ## ✨ Features
 - **Local PySpark ETL**: parses 12 time-series columns (arrays/arrays-of-arrays) and computes `CycleTime_sec` from timestamps.
 - **Time-based data splits**: `train` / `val` / `test` derived from timestamp percentiles → avoids look-ahead leakage.
 - **Baseline regressors**: Ridge / RandomForest / XGBoost + Markdown **metrics report**.
-- **LSTM** (optional): sequence model with **early stopping** on validation RMSE and its own metrics report.
+- **LSTM**: sequence model with **early stopping** on validation RMSE and its own metrics report.
 - **Inference**: predict using the best baseline (single-row CSV) or the LSTM (last WINDOW cycles for a serial).
 - **Makefile**: one-command tasks (`make etl`, `make baselines`, `make lstm`, `make template`, `make clean`).
 
@@ -80,12 +128,23 @@ cycle-time/
      - `timestamp_column:` (e.g., `cycle_timestamp`)
      - `good_bad_label_column:` (kept but **not used** for training)
 
-  **SHAP Feature Selection and Explainability **
-  - Pre-training: set OUT_DIR = Path("outputs/shap_pre")
-  - Post-training: set OUT_DIR = Path("outputs/shap_post")
-    - Inputs required:
-      - outputs/features_spark.parquet (from make etl)
-      - For post-training: outputs/lstm_cycle_time.pt, outputs/lstm_scaler.joblib, outputs/lstm_features.txt (from make lstm)
+  ## 🔍 Explainability (SHAP)
+
+Model explainability is handled using **SHAP (SHapley Additive exPlanations)** to understand which process features most strongly influence predicted cycle time and to validate model behavior against domain intuition.
+
+Explainability is applied at two stages: **pre-training** and **post-training**.
+
+---
+
+### Pre-training: Feature Selection
+
+Pre-training SHAP analysis is used to identify the most informative features before sequence modeling.
+
+**Setup**
+- Set output directory:
+  ```python
+  OUT_DIR = Path("outputs/shap_pre")
+
   Pre-training feature selection
   1) Open shap_run.py and set:
     - OUT_DIR = Path("outputs/shap_pre")
