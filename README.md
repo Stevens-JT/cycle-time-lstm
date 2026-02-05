@@ -144,6 +144,7 @@ Pre-training SHAP analysis is used to identify the most informative features bef
 - Set output directory:
   ```python
   OUT_DIR = Path("outputs/shap_pre")
+  ```
 
   Pre-training feature selection
   1) Open shap_run.py and set:
