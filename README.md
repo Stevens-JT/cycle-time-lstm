@@ -7,6 +7,36 @@ Production-oriented time-series ML pipeline that predicts **next-cycle manufactu
 
 ## Overview
 
+```mermaid
+flowchart LR
+    A[Raw CSV<br/>Manufacturing Cycles] --> B[PySpark ETL<br/>Local Mode]
+
+    B --> B1[Parse Time-Series Arrays<br/>12 Columns]
+    B --> B2[Compute CycleTime_sec<br/>Lead Timestamp]
+    B --> B3[Feature Summaries<br/>mean, std, slope]
+    B --> B4[Time-Based Split<br/>Train / Val / Test]
+
+    B4 --> C[Feature Dataset<br/>Parquet]
+
+    C --> D1[Baseline Models<br/>Ridge / RF / XGBoost]
+    C --> D2[LSTM Sequence Model<br/>PyTorch]
+
+    D1 --> E1[Validation Metrics<br/>Model Selection]
+    E1 --> F1[Best Baseline<br/>Saved Model]
+
+    D2 --> E2[Early Stopping<br/>Validation RMSE]
+    E2 --> F2[Trained LSTM<br/>Plus Scaler]
+
+    F1 --> G[Inference Engine]
+    F2 --> G
+
+    G --> H1[Single-Row CSV<br/>Baseline Prediction]
+    G --> H2[Next-Cycle Prediction<br/>Per Serial]
+
+    C --> I[SHAP Explainability]
+    F2 --> I
+```
+
 This project implements an end-to-end machine learning workflow for **predicting the next cycle time** of a real manufacturing process using historical time-series process data. Cycle time is a primary driver of **throughput, capacity planning, and scheduling**, particularly in processes such as injection molding where small temporal variations can compound into significant production inefficiencies.
 
 The system is intentionally designed to reflect **deployment realities**, including:
