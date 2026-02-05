@@ -47,6 +47,27 @@ The system is intentionally designed to reflect **deployment realities**, includ
 
 While developed in an academic setting, the emphasis throughout is on **operational relevance and production realism**, not classroom optimization.
 
+## Relationship to the Accompanying Paper
+
+This repository is the reference implementation for the accompanying paper:
+
+> **Predicting Manufacturing Cycle Time with Spark-based ETL and Sequence Models**  
+> Jonathan Stevens — M.S. Computer Science (Artificial Intelligence)
+
+The paper focuses on:
+- Problem formulation and gap analysis in manufacturing cycle time prediction
+- Methodological justification for sequence modeling and time-aware evaluation
+- Quantitative results, ablation studies, and explainability findings
+
+This repository focuses on:
+- Reproducible Spark-based ETL and leakage-safe dataset construction
+- Deployment-realistic training, validation, and inference pipelines
+- Artifact alignment between training and inference (models, scalers, features)
+- Practical explainability workflows using SHAP for model validation
+
+Together, the paper and this codebase present a complete, end-to-end view of how explainable sequence models can be applied to real manufacturing data under operational constraints.
+
+
 ## 🧠 Modeling Decisions & Tradeoffs
 
 ### Why next-cycle prediction?
@@ -88,6 +109,71 @@ This helps ensure the model’s behavior aligns with **domain intuition**, not j
 - **LSTM**: sequence model with **early stopping** on validation RMSE and its own metrics report.
 - **Inference**: predict using the best baseline (single-row CSV) or the LSTM (last WINDOW cycles for a serial).
 - **Makefile**: one-command tasks (`make etl`, `make baselines`, `make lstm`, `make template`, `make clean`).
+
+---
+
+## 📊 Results Snapshot
+
+Model performance is evaluated using **RMSE on a strictly time-based test split**, reflecting deployment-time generalization rather than random-split optimism.
+
+**Key findings:**
+- Sequence modeling (LSTM) consistently outperforms static baselines when temporal dependencies are present
+- Time-aware validation prevents leakage and yields realistic error estimates
+- Explainability confirms that dominant contributors align with process intuition (pressure, stroke, flow dynamics)
+
+| Model            | Validation RMSE | Test RMSE |
+|------------------|-----------------|-----------|
+| Ridge Regression | XX.XX           | XX.XX     |
+| Random Forest    | XX.XX           | XX.XX     |
+| XGBoost          | XX.XX           | XX.XX     |
+| **LSTM (PyTorch)** | **XX.XX**       | **XX.XX** |
+
+> Exact values depend on dataset version and feature selection; refer to `outputs/metrics_report.md` and `outputs/lstm_metrics.md` for full experiment logs.
+
+---
+
+## ⚠️ Design Constraints & Assumptions
+
+This project is intentionally scoped to reflect **real manufacturing and deployment constraints**, not idealized modeling conditions.
+
+**Key assumptions and design decisions:**
+
+- **Time causality is enforced**  
+  All splits are strictly timestamp-based to prevent look-ahead leakage. Model performance reflects what would be achievable at deployment time, not retrospective optimization.
+
+- **Next-cycle prediction only**  
+  The model predicts the *immediate next cycle time*, avoiding long-horizon forecasts that compound uncertainty and are difficult to operationalize in real production environments.
+
+- **Feature summarization over raw sequences (for baselines)**  
+  Traditional regressors operate on statistically summarized features, while the LSTM operates on ordered sequences. This isolates the value of temporal modeling.
+
+- **Local Spark execution**  
+  Spark is used in local mode to mirror production ETL patterns while keeping the project runnable without cluster infrastructure.
+
+- **Single-machine scope**  
+  Cross-machine generalization and transfer learning are out of scope. The focus is on modeling temporal dynamics within a consistent process context.
+
+- **Offline training, online-style inference**  
+  Training is batch-based, but inference is designed to simulate online usage by consuming only past cycles at prediction time.
+
+These constraints are deliberate and reflect the realities of deploying ML models in manufacturing systems where data leakage, latency, and interpretability matter as much as raw accuracy.
+
+---
+
+## 🎯 Who This Project Is For
+
+This repository is designed for readers interested in **applied machine learning under real-world constraints**, including:
+
+- **ML Engineers** building time-series models that must respect causality, deployment realism, and interpretability
+- **Applied Scientists** working at the intersection of modeling, experimentation, and domain-driven validation
+- **Manufacturing, CPS, and industrial analytics engineers** exploring predictive approaches beyond static SPC and rule-based systems
+
+The project emphasizes:
+- End-to-end ownership (ETL → modeling → inference → explainability)
+- Honest evaluation through leakage-safe data splits
+- Design tradeoffs grounded in operational reality
+
+For a deeper treatment of the modeling approach, experimental setup, and results, see the accompanying paper included in this repository.
 
 ---
 
